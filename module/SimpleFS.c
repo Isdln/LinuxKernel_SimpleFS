@@ -166,6 +166,11 @@ static bool sb_valid(const struct simplefs_disk_sb* dsb)
 	return memcmp(h, dsb->hash, SIMPLEFS_HASH_SIZE) == 0;
 }
 
+static bool sb_blank(const struct simplefs_disk_sb* dsb)
+{
+	return le32_to_cpu(dsb->magic) == 0;
+}
+
 static int persist_sb(struct super_block* sb, struct simplefs_disk_sb* dsb)
 {
 	int ret;
@@ -350,7 +355,7 @@ static ssize_t file_write(struct file* file, const char __user* ubuf, size_t cou
 	struct simplefs_sb_info* sbi = sb->s_fs_info;
 	struct simplefs_inode_info* mi = SIMPLEFS_I(inode);
 	loff_t file_size = (loff_t)sbi->file_size_sectors * SIMPLEFS_SECTOR_SIZE;
-	loff_t pos = (file->f_flags & O_APPEND) ? file_size : *ppos;
+	loff_t pos = (file->f_flags & O_APPEND) ? 0 : *ppos;
 	size_t done = 0;
 
 	if (pos < 0) {
@@ -468,6 +473,8 @@ static long ioctl_erase(struct super_block* sb)
 	if (ret) {
 		return ret;
 	}
+
+	sbi->num_files = 0;
 
 	pr_info("SimpleFS: FS erased (both SBs and all files cleared). Unmount and remount to reformat.\n");
 	return 0;
@@ -846,10 +853,12 @@ static const struct super_operations simplefs_sops = {
 static int do_fill_super(struct super_block* sb)
 {
 	struct simplefs_sb_info* sbi = sb->s_fs_info;
-	struct simplefs_disk_sb dsb;
+	struct simplefs_disk_sb dsb1, dsb2;
+	struct simplefs_disk_sb* good = NULL;
 	struct inode* root_inode;
 	sector_t total_sectors;
-	int ret;
+	int ret1, ret2;
+	bool valid1, valid2;
 	bool need_format = false;
 
 	total_sectors = (sector_t)(bdev_nr_bytes(sb->s_bdev) / SIMPLEFS_SECTOR_SIZE);
@@ -860,35 +869,51 @@ static int do_fill_super(struct super_block* sb)
 		return -ENOSPC;
 	}
 
-	ret = read_sb(sb, (sector_t)sb1_offset, &dsb);
-	if (ret || !sb_valid(&dsb)) {
-		pr_warn("SimpleFS: SB1 invalid, trying SB2 (sector %d)\n", sb2_offset);
-		ret = read_sb(sb, (sector_t)sb2_offset, &dsb);
+	ret1 = read_sb(sb, (sector_t)sb1_offset, &dsb1);
+	ret2 = read_sb(sb, (sector_t)sb2_offset, &dsb2);
+	valid1 = (ret1 == 0) && sb_valid(&dsb1);
+	valid2 = (ret2 == 0) && sb_valid(&dsb2);
 
-		if (ret || !sb_valid(&dsb)) {
-			pr_warn("SimpleFS: both SBs invalid - formatting device\n");
+	if (valid1) {
+		good = &dsb1;
+
+		if (!valid2) {
+			pr_info("SimpleFS: SB2 invalid, recovering from SB1\n");
+		}
+	}
+	else if (valid2) {
+		good = &dsb2;
+		pr_info("SimpleFS: SB1 invalid, recovering from SB2\n");
+	}
+	else {
+		if (ret1 == 0 && ret2 == 0 && sb_blank(&dsb1) && sb_blank(&dsb2)) {
+			pr_info("SimpleFS: no superblock found - formatting device\n");
 			need_format = true;
 		}
 		else {
-			pr_info("SimpleFS: SB1 corrupted, recovering from SB2\n");
+			pr_err("SimpleFS: both superblocks corrupted - refusing to mount\n");
+			return -EUCLEAN;
 		}
 	}
 
 	if (need_format) {
-		ret = format_fs(sb, total_sectors);
-		if (ret) {
-			return ret;
+		ret1 = format_fs(sb, total_sectors);
+		if (ret1) {
+			return ret1;
 		}
 	}
 	else {
-		sbi->sb1_sector = le64_to_cpu(dsb.sb1_sector);
-		sbi->sb2_sector = le64_to_cpu(dsb.sb2_sector);
-		sbi->file_size_sectors = le32_to_cpu(dsb.file_size_sectors);
-		sbi->num_files = le32_to_cpu(dsb.num_files);
-		sbi->first_file_sector = le64_to_cpu(dsb.first_file_sector);
-		sbi->max_name_len = le32_to_cpu(dsb.max_name_len);
-		sbi->total_sectors = le64_to_cpu(dsb.total_sectors);
-		persist_sb(sb, &dsb);
+		sbi->sb1_sector = le64_to_cpu(good->sb1_sector);
+		sbi->sb2_sector = le64_to_cpu(good->sb2_sector);
+		sbi->file_size_sectors = le32_to_cpu(good->file_size_sectors);
+		sbi->num_files = le32_to_cpu(good->num_files);
+		sbi->first_file_sector = le64_to_cpu(good->first_file_sector);
+		sbi->max_name_len = le32_to_cpu(good->max_name_len);
+		sbi->total_sectors = le64_to_cpu(good->total_sectors);
+
+		if (!valid1 || !valid2) {
+			persist_sb(sb, good);
+		}
 	}
 
 	pr_info("SimpleFS: mounted: sb1=%llu sb2=%llu file_sz=%u num_files=%u total=%llu\n", (u64)sbi->sb1_sector, (u64)sbi->sb2_sector, sbi->file_size_sectors, sbi->num_files, sbi->total_sectors);
