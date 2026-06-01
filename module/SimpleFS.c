@@ -303,7 +303,7 @@ static ssize_t file_read(struct file* file, char __user* ubuf, size_t count, lof
 	struct super_block* sb = inode->i_sb;
 	struct simplefs_sb_info* sbi = sb->s_fs_info;
 	struct simplefs_inode_info* mi = SIMPLEFS_I(inode);
-	loff_t file_size = (loff_t)sbi->file_size_sectors * SIMPLEFS_SECTOR_SIZE;
+	loff_t file_size = i_size_read(inode);
 	loff_t pos = *ppos;
 	size_t done = 0;
 
@@ -355,7 +355,7 @@ static ssize_t file_write(struct file* file, const char __user* ubuf, size_t cou
 	struct simplefs_sb_info* sbi = sb->s_fs_info;
 	struct simplefs_inode_info* mi = SIMPLEFS_I(inode);
 	loff_t file_size = (loff_t)sbi->file_size_sectors * SIMPLEFS_SECTOR_SIZE;
-	loff_t pos = (file->f_flags & O_APPEND) ? 0 : *ppos;
+	loff_t pos = (file->f_flags & O_APPEND) ? i_size_read(inode) : *ppos;
 	size_t done = 0;
 
 	if (pos < 0) {
@@ -407,6 +407,10 @@ static ssize_t file_write(struct file* file, const char __user* ubuf, size_t cou
 	}
 
 	*ppos = pos;
+
+	if (pos > i_size_read(inode)) {
+		i_size_write(inode, pos);
+	}
 
 	inode_set_mtime_to_ts(inode, current_time(inode));
 	mark_inode_dirty(inode);
@@ -646,6 +650,10 @@ static int file_setattr(struct mnt_idmap* idmap, struct dentry* dentry, struct i
 	loff_t fsz = (loff_t)sbi->file_size_sectors * SIMPLEFS_SECTOR_SIZE;
 
 	if (iattr->ia_valid & ATTR_SIZE) {
+		if (iattr->ia_size > fsz) {
+			return -EPERM;
+		}
+
 		if (iattr->ia_size == 0) {
 			int ret = zero_file(sb, sbi, mi->file_index);
 
@@ -653,10 +661,8 @@ static int file_setattr(struct mnt_idmap* idmap, struct dentry* dentry, struct i
 				return ret;
 			}
 		}
-		else if (iattr->ia_size != fsz) {
-			return -EPERM;
-		}
 
+		i_size_write(inode, iattr->ia_size);
 		iattr->ia_valid &= ~ATTR_SIZE;
 	}
 
@@ -677,7 +683,6 @@ static struct inode* make_inode(struct super_block* sb, u32 file_index)
 	struct simplefs_sb_info* sbi = sb->s_fs_info;
 	struct inode* inode;
 	struct simplefs_inode_info* mi;
-	loff_t fsz = (loff_t)sbi->file_size_sectors * SIMPLEFS_SECTOR_SIZE;
 
 	inode = iget_locked(sb, SIMPLEFS_FIRST_FILE_INO + file_index);
 
@@ -695,7 +700,7 @@ static struct inode* make_inode(struct super_block* sb, u32 file_index)
 	inode->i_mode = S_IFREG | 0644;
 	inode->i_uid = current_fsuid();
 	inode->i_gid = current_fsgid();
-	inode->i_size = fsz;
+	inode->i_size = 0;
 	inode->i_blocks = sbi->file_size_sectors;
 	simple_inode_init_ts(inode);
 	inode->i_op = &simplefs_file_iops;
